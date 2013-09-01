@@ -8,16 +8,24 @@ type TestStruct struct {
 	laugh string
 }
 
-// func TestHello(t *testing.T) {
-// 	paxos := Paxos{}
-// 	paxos.Start()
-// }
+func TestHello(t *testing.T) {
+	a, b := 1, 2
+	c, b := 3, 4
+	println(a, b, c)
+}
 
 func TestPaxos(t *testing.T) {
 	paxos := Paxos{
 		Addr: "127.0.0.1:23456",
 	}
-	paxos.Start()
+
+	err := paxos.Start()
+
+	if err != nil {
+		println(err)
+	}
+
+	paxos.Propose("greeting", "haha")
 
 	// quitChan := make(chan int)
 
