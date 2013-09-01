@@ -34,231 +34,190 @@ type MessageAddress struct {
 */
 
 type Message struct {
-	from     MessageAddress
-	to       MessageAddress
-	category int
-	body     []string
+	from      MessageAddress
+	to        MessageAddress
+	category  int
+	body      []string
+	replyChan chan Message
 }
 
 type Proposal struct {
-	number int
-	key    string
-	value  string
-	mutex  *sync.RWMutex
-}
-
-func (p *Proposal) Number() int {
-	p.mutex.RLock()
-	defer p.mutex.RUnlock()
-	return p.number
-}
-
-func (p *Proposal) SetNumber(n int) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.number = n
-}
-
-func (p *Proposal) Value() string {
-	p.mutex.RLock()
-	defer p.mutex.RUnlock()
-	return p.value
-}
-
-func (p *Proposal) SetValue(s string) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.value = s
-}
-
-func newProposal() *Proposal {
-	prop := new(Proposal)
-	prop.mutex = new(sync.RWMutex)
-	return prop
+	number   int
+	key      string
+	value    string
+	mutex    *sync.RWMutex
+	accepted bool
 }
 
 func (p *Paxos) Start() error {
-	p.proposalChan = make(chan Proposal)
-	p.channels = make(map[int]chan Message)
-
 	ln, err := net.Listen("tcp", p.Addr)
 	if err != nil {
-		return err
+		log.Panic(err)
 	}
 
-	outChan := make(chan Message)
+	messages = make(map[int]Message)
+	msgIdCounter := 0
+	inMsgChan := make(chan Message)
+	outMsgChan := make(chan Message)
 
 	go func() {
-		proposal := Proposal{}
-		channelCounter := 0
-
-		messageCounter
-		messages := make(map[int]Message)
-
-		connChan := make(chan net.Conn)
-
-		go func() {
+		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				log.Panic(err)
+				log.Println(err)
+				continue
 			}
-			connChan <- conn
-		}()
+			go func() {
+				var buff [1024]byte
+				n, err := conn.Read(buff)
+				if err != nil {
+					log.Println(err)
+					return
+				}
 
-		for {
-			select {
-			case proposal = <-p.proposalChan:
-				in := make(chan Message)
-				out := make(chan Message)
+				var msg Message
+				err = json.Unmarshal(buff, &msg)
+				if err != nil {
+					log.Println(err)
+					return
+				}
 
-				p.channels[channelCounter] = inChan
-				channelCounter += 1
-
-				go func(channelCounter int) {
-					for {
-						msg, open := <-out
-						if !open {
-							return
-						}
-						msg.from.node = p.Addr
-						msg.from.chanId = channelCounter
-						outChan <- msg
-					}
-				}(channelCounter)
-
-				go p.proposer(proposal, (<-chan Message)(in),
-					(chan<- Message)(out))
-			case outMsg := <-outChan:
-				go func() {
-					conn, err := net.Dial("tcp", outMsg.to.node)
-					if err != nil {
-						log.Panic(err)
-					}
-					defer conn.Close()
-
-					b, err := json.Marshal(outMsg)
-					if err != nil {
-						log.Panic(err)
-					}
-
-					_, err = conn.Write(b)
-					if err != nil {
-						log.Panic(err)
-					}
-				}()
-			case conn := <-connChan:
-				go func() {
-					data := make([]byte, 1024)
-					n, err := conn.Read(data)
-					if err != nil {
-						log.Panic(err)
-					}
-					msg := Message{}
-					json.Unmarshal(data[:n], &msg)
-					if msg.category == 1 {
-						c := make(chan Message)
-						c <- msg
-						p.channels[channelCounter] = c
-						channelCounter += 1
-						go acceptor(channelCounter, c, outChan)
-					} else {
-						p.channels[msg.to.chanId] <- msg
-					}
-				}()
-			}
+				inMsgChan <- msg
+			}()
 		}
 	}()
+
+	select {
+	case proposal := <-p.proposalChan:
+		key = proposal.key
+		if _, ok := p.proposals[key]; ok == nil {
+			var mutex sync.RWMutex
+			p.proposals[key] = Proposal{
+				key:    proposal.key,
+				value:  proposal.value,
+				number: 0,
+				mutex:  *mutex,
+			}
+		} else {
+			originalProposal := p.proposals[key]
+			originalProposal.mutex.Lock()
+			originalProposal.value = proposal.value
+			originalProposal.mutex.Unlock()
+		}
+		go p.proposer(&p.proposals[key], outMsgChan)
+	case msg := <-inMsgChan:
+		// 'prepare' request
+		if msg.category == 1 {
+			msg.replyChan = outMsgChan
+			key = msg.body[0]
+			number = msg.body[1]
+			if _, ok := p.proposals[key]; ok == nil {
+				var mutex sync.RWMutex
+				p.proposals[key] = Proposal{
+					key:    key,
+					number: number,
+					mutex:  *mutex,
+				}
+			}
+			go p.acceptor(msg, &p.proposals[key])
+		} else {
+			msg.replyChan = outMsgChan
+			messages[msg.to.id].replyChan <- msg
+			messages[msg.to.id] = nil
+		}
+	case msg := <-outMsgChan:
+		msg.from = MessageAddress{
+			node: p.Addr,
+			id:   msgIdCounter,
+		}
+		messages[msgIdCounter] = msg
+		msgIdCounter++
+		go func() {
+			b, err := json.Marshal(msg)
+			conn, err := net.Dial("tcp", msg.to.node)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			_, err = conn.Write(b)
+		}()
+	}
 
 	return nil
 }
 
-func (p *Paxos) proposer(proposal Proposal, inChanId int,
-	inChan chan Message, outChan chan Message) error {
-
-	msgId := 0
-
+func (p *Paxos) proposer(proposal *Proposal, outChan chan Message) error {
 	// Send 'prepare' messages
+	replies := make(chan Message)
 	for _, node := range p.Nodes {
-		from := MessageAddress{
-			node:   p.Addr,
-			chanId: inChanId,
-			msgId:  msgId,
-		}
-
 		to := MessageAddress{
-			node:   node,
-			chanId: nil,
-			msgId:  nil,
+			node: node,
+			id:   nil,
 		}
 
 		body := make([]string, 1)
 		body[0] = proposal.number
 
 		msg := Message{
-			from:     from,
-			to:       to,
-			category: 1,
-			body:     body,
+			to:        to,
+			category:  1,
+			body:      body,
+			replyChan: replies,
 		}
 
 		outChan <- msg
 	}
 
 	half := len(p.Nodes) / 2
-	okNodes := make([]MessageAddress)
+	okNodes := make([]Message)
 	noNodesCount := 0
 	highestProposalNumberByNo := 0
 	highestProposalNumberByOk := 0
 
 	// Process replies
 	for {
-		msg = <-inChan
-		if msg.to.msgId == msgId {
-			if msg.category == 2 { // ok
-				append(okNodes, msg.from)
-				if highestProposalNumberByOk < msg.body[0] {
-					highestProposalNumberByOk = msg.body[0]
-					proposal.value = msg.body[1]
-				}
-			} else if msg.category == 3 { // no
-				noNodesCount++
-				if highestProposalNumberByNo < msg.body[0] {
-					highestProposalNumberByNo = msg.body[0]
-				}
+		msg = <-replies
+		if msg.category == 2 { // ok
+			append(okNodes, msg)
+			if highestProposalNumberByOk < msg.body[0] {
+				highestProposalNumberByOk = msg.body[0]
+				proposal.mutex.Lock()
+				proposal.value = msg.body[1]
+				proposal.mutex.Unlock()
+			}
+		} else if msg.category == 3 { // no
+			noNodesCount++
+			if highestProposalNumberByNo < msg.body[0] {
+				highestProposalNumberByNo = msg.body[0]
 			}
 		}
 
 		if len(okNodes) > half {
 			break
 		} else if noNodesCount >= half {
-			p.proposalsMutex.Lock()
-			p.proposals[proposal.key].number = highestProposalNumberByNo
-			p.proposalsMutex.Unlock()
+			proposal.mutex.Lock()
+			proposal.number = highestProposalNumberByNo + 1
+			proposal.mutex.Unlock()
 			go p.Propose(proposal.key, proposal.value)
 			return errors.New("More than half nodes have replied no.  Retrying.")
 		}
 	}
 
-	msgId++
+	// Make a new channel
+	replies = make(chan Message)
+	for _, msg := range okNodes {
 
-	for _, addr := range okNodes {
-		from := MessageAddress{
-			node:   p.Addr,
-			chanId: inChanId,
-			msgId:  msgId,
-		}
-
-		to := addr
+		to := msg.from
 
 		body := make([]string, 2)
 		body[0] = proposal.number
 		body[1] = proposal.value
 
 		msg := Message{
-			from:     from,
-			to:       to,
-			category: 4,
-			body:     body,
+			to:        to,
+			category:  4,
+			body:      body,
+			replyChan: replies,
 		}
 
 		outChan <- msg
@@ -266,90 +225,72 @@ func (p *Paxos) proposer(proposal Proposal, inChanId int,
 
 	okCount := 0
 	for okCount < len(okNodes) {
-		msg = <-inChan
-		if msg.to.msgId == msgId {
-			if msg.category == 5 {
-				okCount++
-			} else if msg.category == 6 {
-				// Restart
-				p.proposalsMutex.Lock()
-				p.proposals[proposal.key].number = msg.body[0]
-				p.proposalsMutex.Unlock()
-				go p.Propose(proposal.key, proposal.value)
-				return errors.New("Some nodes did not accept.  Retrying.")
-			}
+		msg := <-replies
+		if msg.category == 5 {
+			okCount++
+		} else if msg.category == 6 {
+			// Restart
+			proposal.mutex.Lock()
+			proposal.number = msg.body[0]
+			proposal.mutex.Unlock()
+			go p.Propose(proposal.key, proposal.value)
+			return errors.New("Some nodes did not accept.  Retrying.")
 		}
+
 	}
 
-	p.valuesMutex.Lock()
-	p.values[proposal.key] == proposal.value
-	p.valuesMutex.Unlock()
+	proposal.mutex.Lock()
+	proposal.accepted = true
+	proposal.mutex.Unlock()
 
 	return nil
 }
 
-func (p *Paxos) acceptor(inChanId int, inChan chan Message,
-	outChan chan Message) error {
-	msg := <-inChan
+func (p *Paxos) acceptor(msg Message, proposal *Proposal) error {
 	key := msg.body[0]
 	propNumber := msg.body[1]
 
-	if _, ok := p.proposals[key]; ok == nil {
-		p.proposalsMutex.Lock()
-		p.proposals[key] = Proposal{
-			key:    key,
-			value:  nil,
-			number: nil,
-		}
-		p.proposalsMutex.Unlock()
+	replyToReply := make(chan Message)
+	reply := Message{
+		to:        msg.from,
+		replyChan: replyToReply,
 	}
-
-	msgId := 0
-
-	from := MessageAddress{
-		node:   p.Addr,
-		chanId: inChanId,
-		msgId:  msgId,
-	}
-
-	to := msg.from
-
-	p.proposalsMutex.RLock()
-	if propNumber > p.proposals[key].number {
+	if propNumber > proposal.number {
 		body := make([]string, 2)
-		body[0] = p.proposals[key].number
-		body[1] = p.proposals[key].value
+		body[0] = proposal.number
+		body[1] = proposal.value
 
-		outChan <- Message{
-			from:     from,
-			to:       to,
-			category: 2,
-			body:     body,
-		}
+		reply.category = 2
+		reply.body = body
+		msg.replyChan <- reply
 	} else {
 		body := make([]string, 1)
-		body[0] = p.proposals[key].number
+		body[0] = proposal.number
 
-		outChan <- Message{
-			from:     from,
-			to:       to,
-			category: 3,
-			body:     body,
-		}
+		reply.category = 3
+		reply.body = body
+		msg.replyChan <- reply
 	}
-	p.proposalsMutex.RUnlock()
 
-	for {
-		msg = <-inChan
-		if msg.category == 4 && msg.to.msgId == msgId {
-			propNumber = msg.body[0]
-			propValue = msg.body[1]
+	msg = <-replyToReply
 
-			p.proposalsMutex.RLock()
-			// TODO: lock individual proposals rather than
-			// all proposals
-		}
+	number := msg.body[0]
+	value := msg.body[1]
+	proposal.mutex.Lock()
+	reply = Message{
+		to: msg.from,
 	}
+	if proposal.number <= number {
+		reply.category = 5
+		msg.replyChan <- reply
+	} else {
+		reply.category = 6
+		body := make([]string, 1)
+		body[0] = proposal.number
+		reply.body = body
+		msg.replyChan <- reply
+	}
+	proposal.mutex.Unlock()
 }
 
 func (p *Paxos) Propose(key, value string) error {
@@ -357,30 +298,15 @@ func (p *Paxos) Propose(key, value string) error {
 		return errors.New("The Paxos instance has not been started yet.")
 	}
 
-	p.proposalsMutex.Lock()
-	if prop, ok := p.proposals[key]; ok {
-		p.proposals[key] = Proposal{
-			key:    key,
-			value:  value,
-			number: p.proposals[key].number + 1,
-		}
-	} else {
-		p.proposals[key] = Proposal{
-			key:    key,
-			value:  value,
-			number: 0,
-		}
+	proposal := Proposal{
+		key:   key,
+		value: value,
 	}
 
-	// TODO: should we make proposalChan buffered?
-	// or should we run this in a goroutine, so that
-	// the main goroutine won't block?
-	p.proposalChan <- p.proposals[key]
-	p.proposalsMutex.Unlock()
+	// Avoid blocking
+	go func() {
+		p.proposalChan <- proposal
+	}()
 
 	return nil
-}
-
-func hello(greeting string) string {
-	return greeting + " world!"
 }
