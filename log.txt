@@ -1,0 +1,5 @@
+INFO  2013/09/09 23:34:53 paxos.go:63: Starting
+INFO  2013/09/09 23:34:53 paxos.go:63: Starting
+INFO  2013/09/09 23:34:53 paxos.go:63: Starting
+INFO  2013/09/09 23:34:53 paxos.go:329: Sending proposal to proposalChan
+INFO  2013/09/09 23:34:53 paxos.go:331: Done sending proposal
